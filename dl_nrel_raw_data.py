@@ -275,9 +275,10 @@ if __name__ == '__main__':
 
     ###
     # reformat solar profile file
-    fname = 'tracy/Actual_37.65_-121.75_2006_DPV_9MW_5_Min.csv'
+    fname = name + '/Actual_37.65_-121.75_2006_DPV_9MW_5_Min.csv'
     solar_15min = solar_data_format(fname)
-    print(solar_15min[92*4*24:93*4*24])
+    #print(solar_15min[92*4*24:93*4*24])
+    np.savetxt(name + '/solar_15min.csv', solar_15min)
 
     ###
     #sort_results_2040(fname='commercial_results.csv')

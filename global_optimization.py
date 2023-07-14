@@ -1,37 +1,10 @@
 import cvxpy as cp
 import numpy as np
 
-import argparse
-
-import matplotlib.pyplot as plt
-
-
-def parse_inputs(FLAGS):
-    """
-    Parse the file input arguments
-
-    :param `FLAGS`: data object containing all specified arguments
-
-    :return: `storagePen, solarPen, seed, evPen, dir_network, load_fname_orig, n_days`
-    """
-
-    storagePen = float(FLAGS.storagePen) / 10
-    solarPen = float(FLAGS.solarPen) / 10
-    evPen = float(FLAGS.evPen) / 10
-    n_days = int(FLAGS.days)
-
-    if FLAGS.network == 'iowa':
-        dir_network = 'Iowa_feeder/'
-        t_res = 24  # number of points in a day
-    elif FLAGS.network == '123':
-        dir_network = 'IEEE123-1ph-test/'
-        t_res = 24 * 4  # number of points in a day for 15 min resolution
-    else:
-        print('reverting to default Iowa network')
-        dir_network = 'Iowa_feeder/'
-        t_res = 24  # number of points in a day
-
-    return storagePen, solarPen, evPen, dir_network, n_days, t_res
+#import matplotlib.pyplot as plt
+#plt.rcParams["font.family"] = "Times New Roman"
+#plt.rcParams.update({'font.size': 18})
+#plt.rcParams["figure.figsize"] = (7,6)
 
 
 def train_test_split(data, t_idx):
@@ -59,17 +32,7 @@ def stack_daily(data, time_resolution):
     return X
 
 
-def get_demand_bounds(daily_demand, buffer = 1.1):
-
-    upper = (np.max(daily_demand, axis=1)*buffer).clip(min=1)  # allow at least 1kW for upper demand
-    lower = (np.min(daily_demand, axis=1)*buffer).clip(max=0)  # allow at least 0 consumption
-
-    upper[upper - lower < 0.5] += 0.5  # make sure there is at least 0.5 kW difference between bounds
-
-    return upper, lower
-
-
-def global_optimization(upper_demand, lower_demand, nodes_storage, coefs_mat_v, intercept_mat_v,
+def global_optimization_alt(upper_demand, lower_demand, nodes_storage, coefs_mat_v, intercept_mat_v,
                         coefs_mat_tr, intercept_mat_tr, coefs_mat_ti, intercept_mat_ti, coefs_upper_i, coefs_lower_i,
                         v_max, v_min, T_max):
     # coefs_upper_i - reactive power models, first term is intercept second is coefficient
@@ -140,138 +103,297 @@ def global_optimization(upper_demand, lower_demand, nodes_storage, coefs_mat_v, 
     return upper_supply, lower_supply, delta_u.value, delta_l.value
 
 
-def plot_worst_bounds(upper_demand, lower_demand, upper_supply, lower_supply):
-    node = np.unravel_index(upper_supply.argmin(), upper_supply.shape)[0]
-    plt.figure()
-    plt.plot(upper_demand[node, :].T)
-    plt.plot(upper_supply[node, :].T)
-    plt.plot(lower_demand[node, :].T)
-    plt.plot(lower_supply[node, :].T)
-    plt.legend(('upper demand', 'upper supply', 'lower demand', 'lower supply'))
+def load_demand_data_flex(data_path):
+    data = np.load(data_path + 'demand_data.npz')
+    demand = data['demand']
+    demand_imag = data['demand_imag']
+    res_ids = data['res_ids']
+    com_ids = data['com_ids']
+    demand_base = data['demand_base']
+    demand_flex = data['demand_flex']
 
-    node = np.unravel_index(lower_supply.argmax(), lower_supply.shape)[0]
-    plt.figure()
-    plt.plot(upper_demand[node, :].T)
-    plt.plot(upper_supply[node, :].T)
-    plt.plot(lower_demand[node, :].T)
-    plt.plot(lower_supply[node, :].T)
-    plt.legend(('upper demand', 'upper supply', 'lower demand', 'lower supply'))
-    plt.show()
+    return demand_base, demand, demand_imag, demand_flex, res_ids, com_ids
+
+
+def global_optimization(P, imag, lambda_b, lambda_grid, Qmin, Qmax, Q0, cmax, dmax, y_l, y_d, y_c,
+                        lambda_e, ubase, umax, phi,
+                        start_time_network, end_time_network, charge_network, charging_power,
+                        coefs_mat_v, intercept_mat_v, coefs_mat_tr, intercept_mat_tr, coefs_mat_ti, intercept_mat_ti,
+                        v_max, v_min, T_max,
+                        t_res = 0.25):
+
+    T = P.shape[1]
+    Nc = P.shape[0]
+    N = v_max.shape[0]
+    Nt = T_max.shape[0]
+
+    T_max = T_max ** 2
+
+    ev_c_dict = {}
+    ev_q0 = 0
+    ev_q_dict = {}
+    ev_c_all_dict = {}
+
+    for j in range(start_time_network):
+        start_time = start_time_network[j]
+        for i in range(len(start_time)):
+            ev_c_dict[(j,i)] = cp.Variable(T)
+            ev_q_dict[(j,i)] = cp.Variable(T+1)
+    # end for loop
+
+    Q = cp.Variable(shape=(Nc, T + 1))
+    # c is charging variable
+    c = cp.Variable(shape=(Nc, T + 1))
+    # d is discharging variable
+    d = cp.Variable(shape=(Nc, T + 1))
+    # u is flexible load
+    u = cp.Variable(shape=(Nc, T + 1))
+    t_power = cp.Variable(shape=(Nt, T))
+    v_mags = cp.Variable(shape=(N, T))
+    ev_c_all = cp.Variable(shape=(Nc, T))
+
+    s = cp.hstack([P + c - d + ev_c_all + u, imag]).T
+
+    soc_constraints = [
+        c >= 0,
+        c <= np.tile(cmax, T),
+        d >= 0,
+        d <= np.tile(dmax, T),
+        u >= 0,
+        u <= np.tile(umax, T),
+        Q >= Qmin,
+        Q <= Qmax,
+        Q[:, 0] == Q0,
+        Q[:, 1:(T+1)] == y_l * Q[:, 0:T] + y_c * t_res * c[:, 0:T] - y_d * t_res * d[:, 0:T],
+        cp.sum(u, axis=1) == np.sum(ubase, axis=1),
+        0.5 * cp.sum(cp.abs(u - ubase), axis=1) <= phi * np.sum(ubase, axis=1)
+    ]
+    soc_constraints.append(t_power == (coefs_mat_tr @ s + intercept_mat_tr) ** 2
+                       + (coefs_mat_ti @ s + intercept_mat_ti) ** 2)
+    soc_constraints.append(v_mags == coefs_mat_v @ s + intercept_mat_v)
+    for j in range(len(start_time_network)):
+        start_time = start_time_network[j]
+        end_time = end_time_network[j]
+        charge = charge_network[j]
+        for i in range(len(start_time)):
+            ev_times_not = np.ones(T, dtype=int)
+            ev_times_not[start_time[i]:end_time[i]] = 0
+            ev_times_not = ev_times_not == 1
+            soc_constraints.append(ev_c_dict[(j,i)][ev_times_not] == 0)
+            soc_constraints.append(ev_c_dict[(j,i)] >= 0)
+            soc_constraints.append(ev_q_dict[(j,i)][start_time[i]] == ev_q0)
+            #print(charge[i])
+            #print(ev_q_dict[i][-1])
+            soc_constraints.append(ev_q_dict[(j,i)][end_time[i]+1] == charge[i])
+            # add constraints where each variable in ev_c_dict is between 0 and ev_cmax = charging_power
+            soc_constraints.append(ev_c_dict[(j,i)] >= 0)
+            soc_constraints.append(ev_c_dict[(j,i)] <= charging_power)
+            soc_constraints.append(ev_q_dict[(j,i)][1:] == y_l * ev_q_dict[(j,i)][0:-1] + y_c * t_res * ev_c_dict[(j,i)])
+        # end for loop
+        if len(start_time) > 0:
+            ev_c_all_dict[j] = ev_c_dict[(j,0)]
+            if len(start_time) > 1:
+                for i in range(1,len(start_time)):
+                    ev_c_all_dict[j] += ev_c_dict[(j,i)]
+        else:
+            ev_c_all_dict[j] = cp.Variable(1)
+            soc_constraints.append(ev_c_all_dict[j] == 0)
+        ev_c_all[j, :] = ev_c_all_dict[j]
+    # end for loop
+
+    e_cost = lambda_e @ cp.transpose(cp.pos(P + c - d + ev_c_all + u))
+    v_cost = lambda_grid * (cp.sum_squares(cp.pos(v_mags - v_min) + cp.pos(v_max - v_mags)))
+    t_cost = lambda_grid * (cp.sum_squares(cp.pos(T_max - t_power)))
+    objective = cp.Minimize( v_cost + t_cost + e_cost
+            + lambda_b * cp.sum_squares(c + d)
+            )
+
+    prob = cp.Problem(objective, soc_constraints)
+    prob.solve(solver=cp.MOSEK)
+
+    print('status', prob.status)
+
+    cost = lambda_e @ cp.transpose(cp.pos(P + c.value - d.value + ev_c_all.value + u.value))
+
+    return c.value, d.value, Q.value, u.value, ev_c_all.value, ev_c_dict, ev_q_dict, cost, prob.status
+
+
+def close_idx(lst, k):
+    idx = (np.abs(lst - k)).argmin()
+    return idx
+
+
+def expand_ev_times(times, t_res=0.25):
+    nt = np.array([], dtype=int)
+    day = 0
+    for arr in times:
+        nt = np.append(nt, arr + day / t_res * 24)
+        day += 1
+
+    nt = np.array(nt, dtype=int)
+    return nt
+
+
+def expand_inputs(qmins, qmaxs, Q0s, cmaxs, dmaxs, nodes_storage, nodes_solar, tariffs, res_ids, com_ids, Nc, T):
+    qmins_ex = np.zeros(Nc)
+    qmaxs_ex = np.zeros(Nc)
+    Q0s_ex = np.zeros(Nc)
+    cmaxs_ex = np.zeros(Nc)
+    dmaxs_ex = np.zeros(Nc)
+    lambda_e = np.zeros((Nc, T))
+
+    for node in range(Nc):
+        if node in nodes_storage:
+            idx = close_idx(nodes_solar, node)
+            qmins_ex[idx] = qmins[idx]
+            qmaxs_ex[idx] = qmaxs[idx]
+            Q0s_ex[idx] = Q0s[idx]
+            cmaxs_ex[idx] = cmaxs[idx]
+            dmaxs_ex[idx] = dmaxs[idx]
+        if node in res_ids:
+            lambda_e[node, :] = tariffs[0, :]
+        elif node in com_ids:
+            lambda_e[node, :] = tariffs[2, :]
+        else:
+            lambda_e[node, :] = tariffs[0, :]
+
+    return qmins_ex, qmaxs_ex, Q0s_ex, cmaxs_ex, dmaxs_ex, lambda_e
+
+
+def expand_ev_inputs(start_dict, end_dict, charge_dict, day, Nc):
+    start_time_network = []
+    end_time_network = []
+    charge_network = []
+
+    for node in range(Nc):
+        # array of start times = start_dict[node][day]
+        start_time1 = start_dict[node][day]
+        end_time1 = end_dict[node][day]
+        charge1 = charge_dict[node][day]
+        start_time2 = start_dict[node][day+1]
+        end_time2 = end_dict[node][day+1]
+        charge2 = charge_dict[node][day+1]
+
+        # expand data to 2 day horizon
+        start_time = expand_ev_times([start_time1, start_time2])
+        end_time = expand_ev_times([end_time1, end_time2])
+        # print(end_time - start_time)
+        end_time = end_time + (end_time - start_time) * 1.5
+        end_time = np.array(end_time, dtype=int)
+        # print(end_time - start_time)
+        charge = np.concatenate([charge1, charge2])
+
+        start_time_network.append(start_time)
+        end_time_network.append(end_time)
+        charge_network.append(charge)
+
+    return start_time_network, end_time_network, charge_network
+
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train data driven models')
-    parser.add_argument('--opt', default=1, help='Type of optimization 0 is perfect foresight, 1 is bounds')
-    parser.add_argument('--storagePen', default=1, help='storage penetration percentage times 10')
-    parser.add_argument('--solarPen', default=5, help='solar penetration percentage times 10')
-    parser.add_argument('--evPen', default=5, help='EV penetration percentage times 10')
-    parser.add_argument('--network', default='iowa', help='name of network to simulate')
-    parser.add_argument('--days', default=30, help='number of days to simulate')
+    name = 'rural_san_benito/'
+    year = 2050
 
-    FLAGS, unparsed = parser.parse_known_args()
-    print('running with arguments: ({})'.format(FLAGS))
+    lambda_b = 0.001
+    lambda_grid = 125
+    T = 24 * 4 * 2  # 15 minute resolution 2 day overlapping windows
+    t_res = 15.0 / 60.0
+    gamma_l = 1
+    gamma_d = 0.93
+    gamma_c = 0.93
+    charging_power = 6.3
 
-    path_networks = 'Networks/'
-    path_absolute = './'
-
-    # parse inputs
-    storagePen, solarPen, evPen, dir_network, n_days, t_res = parse_inputs(FLAGS)
-
-    # Define length of training set
-    t_idx = t_res * 30  # 30 days of training data, t_res is number of points per day
-
-    # load demand data
-    demand = np.loadtxt(path_networks + dir_network + 'raw_demand.csv')
-    # demand = np.loadtxt(path_networks + dir_network + 'demand_solar.csv')
-    demand_solar_ev = np.loadtxt(path_networks + dir_network + 'demand_solar_ev.csv')
-    demand_imag = np.loadtxt(path_networks + dir_network + 'raw_demand_imag.csv')
-
-    # load storage data for perfect foresight controller
-    data = np.load(path_networks + dir_network +
-                   'storage_data' + str(solarPen) + str(storagePen) + str(evPen) + '.npz')
-    sGenFull = data['sGenFull']
+    data = np.load(name + 'storage_data.npz')
     nodes_storage = data['nodesStorage']
-    qmin = data['qmin']
-    qmax = data['qmax']
-    umin = data['umin']
-    umax = data['umax']
+    nodes_solar = data['nodesSolar']
+    qmins = data['qmin']
+    qmaxs = data['qmax']
+    cmaxs = -data['umin']
+    dmaxs = data['umax']
+    Q0s = qmaxs * 0.5
+    phis = data['phis']
 
-    # Split real and reactive power demand into training and test set
-    demand_train, demand = train_test_split(demand, t_idx)
-    demand_solar_ev_train, demand_solar_ev = train_test_split(demand_solar_ev, t_idx)
-    demand_imag_train, demand_imag = train_test_split(demand_imag, t_idx)
+    data = np.load(name + 'demand_data.npz')
+    res_ids = data['res_ids']
+    com_ids = data['com_ids']
+    demand_imag = data['demand_imag']
+    # demand_ev = np.loadtxt(name + 'demand_solar_ev.csv')
+    demand = np.loadtxt(name + 'demand_solar.csv')
+    demand_flex = np.loadtxt(name + 'demand_flex.csv')
+    tariffs = np.loadtxt(name + 'tariffs.csv')
+
+    data = np.load(name + 'EV_charging_data' + '.npz', allow_pickle=True)
+    start_dict = data['start_dict'][()]
+    end_dict = data['end_dict'][()]
+    charge_dict = data['charge_dict'][()]
 
     # load models
-    data = np.load(path_networks + dir_network + 'model_coefs.npz')
+    data = np.load(name + 'model_coefs.npz')
     coefs_mat_v = data['coefs_mat_v']
     intercept_mat_v = data['intercept_mat_v']
     coefs_mat_tr = data['coefs_mat_tr']
     intercept_mat_tr = data['intercept_mat_tr']
     coefs_mat_ti = data['coefs_mat_ti']
     intercept_mat_ti = data['intercept_mat_ti']
-    coefs_upper_i = data['coefs_upper_i']  # reactive power models
-    coefs_lower_i = data['coefs_lower_i']  # first term is intercept second is coefficient
+    #coefs_upper_i = data['coefs_upper_i']  # reactive power models
+    #coefs_lower_i = data['coefs_lower_i']  # first term is intercept second is coefficient
 
     # load voltage and transformer limits
-    data = np.load(path_networks + dir_network + 'grid_data.npz')
-    t_limits = data['t_limits']
-    v_max = data['v_max']
-    v_min = data['v_min']
+    T_max = np.loadtxt(name + 'transformer_limits.csv')
+    data = np.load(name + 'local' + '_metrics.npz')
+    v_mags_all = data['v_mags_all']
+    v_max, v_min = assign_voltage_limits(v_mags_all)
+    _, v_max, v_min = clean_voltages(v_mags_all, v_max, v_min)
+
+    n_days = int(demand.shape[1] * t_res / 24)
+    t_day = int(24 / t_res)
 
     # initialize variables
-    c_all = np.zeros((nodes_storage.size, demand.shape[1]))
-    d_all = np.zeros((nodes_storage.size, demand.shape[1]))
-    upper_supply = np.zeros((demand.shape[0], t_res * (n_days + 1)))
-    lower_supply = np.zeros((demand.shape[0], t_res * (n_days + 1)))
+    c_network = np.zeros(demand.shape)
+    d_network = np.zeros(demand.shape)
+    u_network = np.zeros(demand.shape)
+    ev_network = np.zeros(demand.shape)
+    cost_network = np.zeros(n_days)
+
+    ubase = demand_flex
+    umax = np.max(ubase, axis=1)
+
+    Nc = demand.shape[0]
+    #T_all = demand.shape[1]
+
+    qmins, qmaxs, Q0s, cmaxs, dmaxs, lambda_e = \
+        expand_inputs(qmins, qmaxs, Q0s, cmaxs, dmaxs, nodes_storage, nodes_solar, tariffs, res_ids, com_ids, Nc, T)
+
+    if 'MOSEK' in cp.installed_solvers():
+        print('MOSEK is installed')
+    else:
+        raise ValueError('MOSEK is not installed. Cannot run optimization')
 
     # daily loop
     for day in range(n_days):
         print('running day', day)
 
-        # previous week historical data
-        # use data with full solar and EV
-        if day == 0:
-            demand_prev = demand_solar_ev_train[:, -7 * t_res:]
-        else:
-            demand_prev = demand_solar_ev[:, (day - 1) * t_res:day * t_res]
-
         # extract perfect foresight data for current loop
-        demand_day = demand[:, day * t_res:(day+1) * t_res]
-        demand_solar_ev_day = demand_solar_ev[:, day * t_res:(day+1) * t_res]
+        demand_day = demand[:, day * t_day:(day+1) * t_day]
+        demand_imag_day = demand_imag[:, day * t_day:(day+1) * t_day]
 
-        # Get demand bounds
-        upper_demand = np.zeros((demand.shape[0], t_res))
-        lower_demand = np.zeros((demand.shape[0], t_res))
-        for node in range(demand.shape[0]):
+        start_time_network, end_time_network, charge_network = \
+            expand_ev_inputs(start_dict, end_dict, charge_dict, day, Nc)
 
-            daily_demand = stack_daily(demand_prev[node, :], t_res)
-            # demand bounds are max of past weeks data with solar and EV
-            upper_demand[node, :], lower_demand[node, :] = get_demand_bounds(daily_demand)
-
-        print(upper_demand.shape)
-        #print(np.min(upper_demand-lower_demand))
-        nodes_storage = np.arange(demand.shape[0])
-
-        # get supply bounds
-        upper_supply_d = np.zeros((demand.shape[0], t_res))
-        lower_supply_d = np.zeros((demand.shape[0], t_res))
-        for t in range(t_res):
-            print('running time step:', t)
-            # Global optimization
-            upper_supply_t, lower_supply_t, delta_u, delta_l = global_optimization(upper_demand[:, t], lower_demand[:, t], nodes_storage,
+        # Global optimization
+        c, d, Q, u, ev_c_all, ev_c_dict, ev_q_dict, cost, status = \
+            global_optimization(demand_day, demand_imag_day, lambda_b, lambda_grid, qmins, qmaxs, Q0s, cmaxs, dmaxs, y_l, y_d, y_c,
+                            lambda_e, ubase, umax, phis,
+                            start_time_network, end_time_network, charge_network, charging_power,
                             coefs_mat_v, intercept_mat_v, coefs_mat_tr, intercept_mat_tr, coefs_mat_ti, intercept_mat_ti,
-                            coefs_upper_i, coefs_lower_i, v_max, v_min, t_limits)
+                            v_max, v_min, T_max)
 
-            upper_supply_d[:, t] = upper_supply_t
-            lower_supply_d[:, t] = lower_supply_t
+        c_network[:, day * t_day:(day+1) * t_day] = c
+        d_network[:, day * t_day:(day + 1) * t_day] = d
+        u_network[:, day * t_day:(day + 1) * t_day] = u
+        ev_network[:, day * t_day:(day + 1) * t_day] = ev_c_all
+        cost_network[day] = cost
 
-        upper_supply[:, t_res * day: t_res * (day + 1)] = upper_supply_d
-        lower_supply[:, t_res * day: t_res * (day + 1)] = lower_supply_d
-
-        np.savez(path_networks + dir_network + 'bound_data.npz', upper_supply=upper_supply, lower_supply=lower_supply)
-        print('Saved bounds')
-
-    plot_worst_bounds(upper_demand, lower_demand, demand_solar_ev[:, 0:n_days * t_res], demand_solar_ev[:, 0:n_days * t_res])
-
-
-
-
+    np.savez(name + 'GC_data.npz', c_network=c_network, d_network=d_network, u_network=u_network,
+             ev_network=ev_network, cost_network=cost_network)
+    print('SAVED GC DATA')

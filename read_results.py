@@ -1,35 +1,20 @@
 import numpy as np
 import pandas as pd
-import argparse
-import matplotlib.pyplot as plt
+import os
 
-def parse_inputs(FLAGS):
-    """
-    Parse the file input arguments
+from opendss_interface import *
 
-    :param `FLAGS`: data object containing all specified arguments
 
-    :return: `storagePen, solarPen, seed, evPen, dir_network, load_fname_orig, n_days`
-    """
+def load_demand_data_flex(data_path):
+    data = np.load(data_path + 'demand_data.npz')
+    demand = data['demand']
+    demand_imag = data['demand_imag']
+    res_ids = data['res_ids']
+    com_ids = data['com_ids']
+    demand_base = data['demand_base']
+    demand_flex = data['demand_flex']
 
-    storagePen = float(FLAGS.storagePen) / 10
-    solarPen = float(FLAGS.solarPen) / 10
-    evPen = float(FLAGS.evPen) / 10
-    n_days = int(FLAGS.days)
-    metrics = int(FLAGS.metrics)
-
-    if FLAGS.network == 'iowa':
-        dir_network = 'Iowa_feeder/'
-        t_res = 24  # number of points in a day
-    elif FLAGS.network == '123':
-        dir_network = 'IEEE123-1ph-test/'
-        t_res = 24 * 4  # number of points in a day for 15 min resolution
-    else:
-        print('reverting to default Iowa network')
-        dir_network = 'Iowa_feeder/'
-        t_res = 24  # number of points in a day
-
-    return storagePen, solarPen, evPen, dir_network, n_days, t_res, metrics
+    return demand_base, demand, demand_imag, demand_flex, res_ids, com_ids
 
 
 def train_test_split(data, t_idx):
@@ -39,119 +24,183 @@ def train_test_split(data, t_idx):
     return data_train, data_test
 
 
-def get_t_vio_metric(t_profile_real, t_profile_imag, t_limits):
-    """
-    Calculate transformer violation metric as sum of deviations above the limits as percentage of limits
-    :param t_profile_real:
-    :param t_profile_imag:
-    :param t_limits:
-    :return: transformer violation metric and number of violations
-    """
-    limits_expanded = np.tile(t_limits.reshape((t_limits.size, 1)), (1, t_profile_real.shape[1]))
-    vio_where = (t_profile_real ** 2 + t_profile_imag ** 2 - limits_expanded**2) > 0
-    vio = np.sqrt(t_profile_real[vio_where] ** 2 + t_profile_imag[vio_where] ** 2) - limits_expanded[vio_where]
-    vio = np.sum(vio / limits_expanded[vio_where] * 100)
-    num_vio = np.sum(t_profile_real**2 + t_profile_imag**2 - np.tile(t_limits.reshape((535,1))**2, (1,720)) > 0)
-    return vio, num_vio
+def assign_transformer_limits(trans_base):
+    transformer_limits = np.max(trans_base, axis=1) * 1.2
+    #print(transformer_limits)
+    #print(transformer_limits.shape)
+
+    return transformer_limits
 
 
-def get_v_vio_metric(v_profile, v_max, v_min):
-    max_expanded = np.tile(v_max.reshape((v_max.size, 1)), (1, v_profile.shape[1]))
-    min_expanded = np.tile(v_min.reshape((v_min.size, 1)), (1, v_profile.shape[1]))
-    vio = np.sum((v_profile - max_expanded).clip(min=0) + (min_expanded - v_profile).clip(min=0))
-    num_vio = np.sum(v_profile > max_expanded) + np.sum(v_profile < min_expanded)
-    return vio, num_vio
+def assign_voltage_limits(v_base):
+    v_max = np.ones(v_base.shape[0]) * 1.05
+    v_min = np.ones(v_base.shape[0]) * 0.95
 
-def plot_extreme_bounds(upper_supply, lower_supply):
-    node = np.unravel_index(lower_supply.argmax(), lower_supply.shape)[0]
-    plt.figure()
-    plt.plot(upper_supply[node, :].T)
-    plt.plot(lower_supply[node, :].T)
+    return v_max, v_min
 
-    node = np.unravel_index(upper_supply.argmin(), upper_supply.shape)[0]
-    plt.figure()
-    plt.plot(upper_supply[node, :].T)
-    plt.plot(lower_supply[node, :].T)
-    plt.show()
+
+def get_t_vio_metric(t_profile, t_limits, t_res=0.25):
+    window = int(2 / t_res)
+    vios = np.zeros(t_profile.shape[0])
+    for t in range(t_profile.shape[1] - window):
+        vio = np.mean(t_profile[:, t:t+window], axis=1) > t_limits
+        vios += vio
+
+    return vios
+
+
+def get_v_vio_metric(v_profile, v_max, v_min, t_res=0.25):
+    v_profile, v_max, v_min = clean_voltages(v_profile, v_max, v_min)
+    window = int(1 / t_res)
+    vios = np.zeros(v_profile.shape[0])
+    for t in range(v_profile.shape[1] - window):
+        vio = np.mean(v_profile[:, t:t + window], axis=1) > v_max
+        vios += vio
+        vio = np.mean(v_profile[:, t:t + window], axis=1) < v_min
+        vios += vio
+
+    return vios
+
+
+def clean_voltages(v_profile, v_max, v_min):
+    connected = np.min(v_profile, axis=1) > 0.01
+    v_profile = v_profile[connected, :]
+    v_max = v_max[connected]
+    v_min = v_min[connected]
+
+    # align substation transformer tap
+    v_profile = v_profile - np.mean(v_profile[0, :]) + 1
+
+    return v_profile, v_max, v_min
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train data driven models')
-    parser.add_argument('--opt', default=1, help='Type of optimization 0 is perfect foresight, 1 is bounds')
-    parser.add_argument('--storagePen', default=1, help='storage penetration percentage times 10')
-    parser.add_argument('--solarPen', default=5, help='solar penetration percentage times 10')
-    parser.add_argument('--evPen', default=5, help='EV penetration percentage times 10')
-    parser.add_argument('--network', default='iowa', help='name of network to simulate')
-    parser.add_argument('--days', default=30, help='number of days to simulate')
-    parser.add_argument('--metrics', default=0, help='0=optimization results, 1=grid metrics')
+    # name = 'sacramento/'
+    # name = 'iowa/'
+    # name = 'central_SF/'
+    # name = 'commercial_SF/'
+    # name = 'tracy/'
+    name = 'rural_san_benito/'
+    # name = 'los_banos/'
+    # name = 'vermont/'
+    # name = 'arizona/'
+    # name = 'marin/'
+    # name = 'oakland/'
+    # year = 2020
+    year = 2050
+    controller = 'local'
+    # controller = 'central'
 
-    FLAGS, unparsed = parser.parse_known_args()
-    print('running with arguments: ({})'.format(FLAGS))
+    cwd = os.getcwd()  # get directory before going into network
+    network_name = name + 'network/'
+    network_type = get_network_type(name)
+    load_fname_orig = 'Loads_orig.dss'
+    load_fname = 'Loads.dss'
+    master_fname = 'Master.dss'
 
-    path_networks = 'Networks/'
-    path_absolute = './'
+    if controller == 'local':
+        data = np.load(name + 'LC_data.npz')
+        c_network = data['c_network']
+        d_network = data['d_network']
+        u_network = data['u_network']
+        ev_network = data['ev_network']
+        cost_network = data['cost_network']
+        _, _, demand_imag, _, res_ids, com_ids = load_demand_data_flex(name)
+        demand_ev = np.loadtxt(name + 'demand_solar_ev.csv')
+        demand = np.loadtxt(name + 'demand_solar.csv')
+        net_demand = demand_ev + c_network - d_network + u_network
+        pf = 0.92
+        net_demand_imag = demand_imag + np.tan(np.arccos(pf)) * u_network
+    elif controller == 'central':
+        data = np.load(name + 'GC_data.npz')
+        c_network = data['c_network']
+        d_network = data['d_network']
+        u_network = data['u_network']
+        ev_network = data['ev_network']
+        cost_network = data['cost_network']
+        _, _, demand_imag, _, res_ids, com_ids = load_demand_data_flex(name)
+        demand_ev = np.loadtxt(name + 'demand_solar_ev.csv')
+        demand = np.loadtxt(name + 'demand_solar.csv')
+        net_demand = demand_ev + c_network - d_network + u_network
+        pf = 0.92
+        net_demand_imag = demand_imag
 
-    # parse inputs
-    storagePen, solarPen, evPen, dir_network, n_days, t_res, metrics = parse_inputs(FLAGS)
+    # get default network loads
+    copy_loadfile(network_name + load_fname_orig, network_name + load_fname)
+    #demand = get_load_bases(network_name, load_fname, network_type)
+    # print('demand shape', demand.shape)
 
-    # Define length of training set
-    t_idx = t_res * 90  # 30 days of training data, t_res is number of points per day
+    # Initialize openDSS
+    dssObj = dss.DSS
+    dssCircuit = dssObj.ActiveCircuit
+    # Run PF with initial values
+    runPF(network_name, master_fname, dssObj)
+    network_name = os.getcwd() + '/'
 
-    # load data
-    #demand = np.loadtxt(path_networks + dir_network + 'raw_demand.csv')
-    #demand = np.loadtxt(path_networks + dir_network + 'demand_solar.csv')
-    demand = np.loadtxt(path_networks + dir_network + 'demand_solar_ev.csv')
-    demand_imag = np.loadtxt(path_networks + dir_network + 'raw_demand_imag.csv')
+    # export_taps writes the data files that contain info about transformer power and tap changes
+    export_taps(network_name, master_fname, dssObj)
+    tap_fname = get_tap_changes_filename(network_name)
+    t_fname = get_t_power_filename(network_name)
 
-    # Split real and reactive power demand into training and test set
-    demand_train, demand = train_test_split(demand, t_idx)
-    #demand_solar_ev_train, demand_solar_ev = train_test_split(demand_solar_ev, t_idx)
-    demand_imag_train, demand_imag = train_test_split(demand_imag, t_idx)
+    # read tap changes
+    taps_prev = np.nan
+    tap_changes, taps_prev = get_tap_changes(tap_fname, taps_prev=np.nan)
 
-    data = np.load(path_networks + dir_network + 'bound_data.npz')
-    upper_supply = data['upper_supply']
-    lower_supply = data['lower_supply']
+    # read transformer powers only the input power
+    t_real, t_reac, t_apparent_power = get_t_power(t_fname)
+    t_real, t_reac, t_apparent_power = t_input_powers(t_real, t_reac, t_apparent_power)
+    # print('transformers shape', t_real.shape)
 
-    lower_supply = lower_supply[:, 0: n_days * t_res]
-    upper_supply = upper_supply[:, 0: n_days * t_res]
+    # get voltages
+    v_mags = get_VmagsPu(dssCircuit)
 
-    # demand with LCs
-    demand_new = demand[:,0: n_days*t_res].clip(lower_supply[:,0: n_days*t_res], upper_supply[:,0: n_days*t_res])
+    # Print network characteristics
+    print('N = ', v_mags.shape)
+    print('Nc = ', demand.shape)
+    print('N transformers = ', t_apparent_power.shape)
 
-    if metrics == 0:
-        np.savetxt(path_networks + dir_network + 'demand_storage.csv', demand_new)
+    ### make and test new loads
+    T = demand.shape[1]
+    t_real_all = np.zeros((t_apparent_power.size, T))
+    t_reac_all = np.zeros((t_apparent_power.size, T))
+    t_powers_all = np.zeros((t_apparent_power.size, T))
+    v_mags_all = np.zeros((v_mags.size, T))
+    for t in range(T):
+        print('time step:', t)
+        loads_real_new = net_demand[:, t]
+        loads_imag_new = net_demand_imag[:, t]
 
-    elif metrics == 1:
-        # load grid data
-        v_profile_0 = np.loadtxt(path_absolute + path_networks + dir_network + 'v_profile_stor.csv')
-        v_profile = np.loadtxt(path_absolute + path_networks + dir_network + 'v_profile.csv')[:,0:720]
+        # update openDSS load file
+        updateLoads_3ph(network_name, load_fname, loads_real_new, loads_imag_new, network_type)
 
-        t_profile_real_0 = np.loadtxt(path_absolute + path_networks + dir_network + 't_profile_real_stor.csv')
-        t_profile_imag_0 = np.loadtxt(path_absolute + path_networks + dir_network + 't_profile_imag_stor.csv')
-        t_profile_real = np.loadtxt(path_absolute + path_networks + dir_network + 't_profile_real.csv')[:,0:720]
-        t_profile_imag = np.loadtxt(path_absolute + path_networks + dir_network + 't_profile_imag.csv')[:,0:720]
+        runPF(network_name, master_fname, dssObj)
+        export_taps(network_name, master_fname, dssObj)
+        t_real, t_reac, t_apparent_power = get_t_power(t_fname)
+        t_real, t_reac, t_apparent_power = t_input_powers(t_real, t_reac, t_apparent_power)
+        v_mags = get_VmagsPu(dssCircuit)
+        t_real_all[:, t] = t_real
+        t_reac_all[:, t] = t_reac
+        t_powers_all[:, t] = t_apparent_power
+        v_mags_all[:, t] = v_mags
 
-        taps_profile = np.loadtxt(path_absolute + path_networks + dir_network + 'taps_profile_stor.csv')
+    # evaluate binary metrics
+    if year == 2020 and controller == 'local':
+        transformer_limits = assign_transformer_limits(t_powers_all)
+        #np.savetxt('/Users/tom/Dropbox/Pycharm3/DERCS_x/rural_san_benito/' + 'transformer_limits.csv', transformer_limits)
+        np.savetxt(cwd + '/' + name + 'transformer_limits.csv', transformer_limits)
+        v_max, v_min = assign_voltage_limits(v_mags_all)
+    else:
+        transformer_limits = np.loadtxt(cwd + '/' + name + 'transformer_limits.csv')
+        v_max, v_min = assign_voltage_limits(v_mags_all)
 
-        # load voltage and transformer limits
-        data = np.load(path_networks + dir_network + 'grid_data.npz')
-        t_limits = data['t_limits']
-        v_max = data['v_max']
-        v_min = data['v_min']
+    t_vios = get_t_vio_metric(t_powers_all, transformer_limits)
+    v_vios = get_v_vio_metric(v_mags_all, v_max, v_min)
 
-        #plot v and t by node
-        """
-        limits_expanded = np.tile(t_limits.reshape((t_limits.size, 1)), (1, t_profile_real.shape[1]))
-        t_profile_0 = (np.sqrt(t_profile_real_0 ** 2 + t_profile_imag_0 ** 2)/limits_expanded)#[400:,:]
-        t_profile = (np.sqrt(t_profile_real ** 2 + t_profile_imag ** 2)/limits_expanded)#[400:,:]
-        x = np.tile(np.arange(t_profile.shape[0]).reshape((t_profile.shape[0], 1)), (1, t_profile.shape[1]))
+    print(np.sum(t_vios > 1) / t_vios.size)
+    print(np.sum(v_vios > 1) / v_vios.size)
 
-        plt.figure()
-        plt.scatter(x, t_profile_0.clip(max=1), s=2)
-        plt.scatter(x, 1.2*t_profile, s=2)
-        plt.plot(np.arange(t_profile.shape[0]), 1*np.ones(t_profile.shape[0]))
-        plt.ylabel('Transformer apparent power')
-        plt.xlabel('Transformer ID')
-        plt.legend(('transformer capacity', '2020', '2050 LCs'))
-        plt.show()
-        """
+    np.savez(cwd + '/' + name + controller + '_metrics.npz', t_real_all=t_real_all, t_reac_all=t_reac_all,
+             t_powers_all=t_powers_all, v_mags_all=v_mags_all,
+             cost_network=cost_network, t_vios=t_vios, v_vios=v_vios)
+    print('SAVED METRICS')
+

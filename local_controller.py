@@ -4,76 +4,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-def local_controller_solve(P, lambda_b, lambda_cap, T, t_res, Qmin, Qmax, Q0,
-                       cmax, dmax, gamma_l, gamma_d, gamma_c, lambda_e, umin, umax):
-    """
-    :param P: net uncontrollable load (kW)
-    :param lambda_b: battery operation penalty ($)
-    :param lambda_cap: bounds violation penalty ($)
-    :param T: Length of MPC horizon
-    :param t_res: time resolution (fraction of hour)
-    :param Qmin: Minimum charge level (kWh)
-    :param Qmax: Maximum charge level (kWh)
-    :param Q0: Initial charge level (kWh)
-    :param cmax: Maximum charge rate (kW)
-    :param dmax: Maximum discharge rate (kW)
-    :param gamma_l: Leakage coefficient (% / t_res)
-    :param gamma_d: Discharge efficiency (%)
-    :param gamma_c: Charge efficiency (%)
-    :param lambda_e: Price of electricity ($)
-    :param umin: lower bound from GC (kW)
-    :param umax: upper bound from GC (kW)
-    :return: Charge, discharge, SOC profile, bounds violation, controller status
-    """
-
-    # TOU price arbitrage within
-
-    # Q is battery charge level. First entry must be placed to a constant input
-    Q = cp.Variable(T + 1)
-    # c is charging variable
-    c = cp.Variable(T)
-    # d is discharging variable
-    d = cp.Variable(T)
-
-    soc_constraints = [
-        c >= 0,
-        c <= np.tile(cmax, T),
-        d >= 0,
-        d <= np.tile(dmax, T),
-        Q >= Qmin,
-        Q <= Qmax,
-        # P + c - d + ev_c_all >= umin,
-        # P + c - d + ev_c_all <= umax,
-        # np.tile(u_min,T) <= P+c-d, P+c-d <= np.tile(u_max,T),  # moved to soft constraint
-        Q[0] == Q0,
-        Q[1:(T+1)] == gamma_l * Q[0:T] + gamma_c * t_res * c[0:T] - gamma_d * t_res * d[0:T]
-    ]
-
-    # The @ symbol is matrix multiplication
-    objective = cp.Minimize(
-            lambda_e.reshape((1, lambda_e.size)) @ cp.reshape(cp.pos(P + c - d), (T, 1))
-            + lambda_cap * cp.sum((cp.pos(P + c - d - umax) + cp.pos(umin - (P + c - d))) ** 2)
-            )
-    if lambda_b > 0:
-        objective += cp.Minimize(lambda_b * cp.sum_squares(c + d))
-
-    prob = cp.Problem(objective, soc_constraints)
-    prob.solve(solver=cp.ECOS)
-
-    try:
-        bounds_cost = lambda_cap * np.sum((np.maximum(P + c.value - d.value - umax, 0)
-                            + np.maximum(umin - (P + c.value - d.value), 0)) ** 2)
-    except:
-        print('controller cost evaluation failed')
-        bounds_cost = np.nan
-
-    return c.value, d.value, Q.value, bounds_cost, prob.status
-
-
-def local_controller_EV_solve(P, lambda_b, lambda_cap, T, Qmin, Qmax, Q0,
+def local_controller_EV_flex_solve(P, lambda_b, T, Qmin, Qmax, Q0,
                        cmax, dmax, y_l, y_d, y_c,
-                       lambda_e, umin, umax,
-                       start_time, end_time, charge, charging_power):
+                       lambda_e, ubase, umax, phi,
+                       start_time, end_time, charge, charging_power, t_res = 0.25):
 
     ev_c_dict = {}
 
@@ -90,20 +24,22 @@ def local_controller_EV_solve(P, lambda_b, lambda_cap, T, Qmin, Qmax, Q0,
     c = cp.Variable(T)
     # d is discharging variable
     d = cp.Variable(T)
+    # u is flexible load
+    u = cp.Variable(T)
 
     soc_constraints = [
         c >= 0,
         c <= np.tile(cmax, T),
         d >= 0,
         d <= np.tile(dmax, T),
+        u >= 0,
+        u <= np.tile(umax, T),
         Q >= Qmin,
         Q <= Qmax,
-        # modify constraints P + c - d <= u_max and u_min to be P + c - d + ev_c_all
-        # P + c - d + ev_c_all >= umin,
-        # P + c - d + ev_c_all <= umax,
-        # np.tile(u_min,T) <= P+c-d, P+c-d <= np.tile(u_max,T),  # moved to soft constraint
         Q[0] == Q0,
-        Q[1:(T+1)] == y_l * Q[0:T] + y_c * c[0:T] - y_d * d[0:T]
+        Q[1:(T+1)] == y_l * Q[0:T] + y_c * t_res * c[0:T] - y_d * t_res * d[0:T],
+        cp.sum(u) == np.sum(ubase),
+        0.5 * cp.sum(cp.abs(u - ubase)) <= phi * np.sum(ubase)
     ]
 
     for i in range(len(start_time)):
@@ -119,7 +55,7 @@ def local_controller_EV_solve(P, lambda_b, lambda_cap, T, Qmin, Qmax, Q0,
         # add constraints where each variable in ev_c_dict is between 0 and ev_cmax = charging_power
         soc_constraints.append(ev_c_dict[i] >= 0)
         soc_constraints.append(ev_c_dict[i] <= charging_power)
-        soc_constraints.append(ev_q_dict[i][1:] == y_l * ev_q_dict[i][0:-1] + y_c * ev_c_dict[i])
+        soc_constraints.append(ev_q_dict[i][1:] == y_l * ev_q_dict[i][0:-1] + y_c * t_res * ev_c_dict[i])
 
     # end for loop
 
@@ -132,100 +68,174 @@ def local_controller_EV_solve(P, lambda_b, lambda_cap, T, Qmin, Qmax, Q0,
         ev_c_all = cp.Variable(1)
         soc_constraints.append(ev_c_all == 0)
 
+    #print(P.size)
+    #print(ev_c_all.size)
 
     objective = cp.Minimize(
-            lambda_e.reshape((1, lambda_e.size)) @ cp.reshape(cp.pos(P + c - d + ev_c_all), (T, 1))
-            + lambda_cap * cp.sum((cp.pos(P + c - d + ev_c_all - umax) + cp.pos(umin - (P + c - d + ev_c_all))) ** 2)
-            + lambda_b * cp.sum_squares(c + d + ev_c_all)
+            lambda_e.reshape((1, lambda_e.size)) @ cp.reshape(cp.pos(P + c - d + ev_c_all + u), (T, 1))
+            + lambda_b * cp.sum_squares(c + d)
             )
 
     prob = cp.Problem(objective, soc_constraints)
     prob.solve(solver=cp.ECOS)
 
-    # print('P', P)
-    # print(np.sum(P))
-    # print(P + c.value - d.value + ev_c_all.value)
+    print('status', prob.status)
 
-    try:
-        bounds_cost = lambda_cap * np.sum((np.maximum(P + c.value - d.value + ev_c_all.value - umax, 0)
-                            + np.maximum(umin - (P + c.value - d.value + ev_c_all.value), 0)) ** 2)
-    except:
-        print('controller cost evaluation failed')
-        bounds_cost = np.nan
+    cost = lambda_e.reshape((1, lambda_e.size)) @ np.maximum(P + c.value - d.value + ev_c_all.value, 0).reshape((T, 1))
 
-    # print("cost e", lambda_e.reshape((1, lambda_e.size)) @ np.maximum(P + c.value - d.value + ev_c_all.value, 0).reshape((T, 1)) )
-    # print('cost of bounds', bounds_cost )
+    return c.value, d.value, Q.value, u.value, ev_c_all.value, ev_c_dict, ev_q_dict, cost, prob.status
 
-    return c.value, d.value, Q.value, ev_c_all.value, ev_c_dict, ev_q_dict, bounds_cost, prob.status
+
+def close_idx(lst, k):
+    idx = (np.abs(lst - k)).argmin()
+    return idx
+
+
+def expand_ev_times(times, t_res=0.25):
+    nt = np.array([], dtype=int)
+    day = 0
+    for arr in times:
+        nt = np.append(nt, arr + day / t_res * 24)
+        day += 1
+
+    nt = np.array(nt, dtype=int)
+    return nt
+
+
+def local_controller_outer(lambda_b, T, gamma_l, gamma_d, gamma_c, charging_power, nodes_storage, nodes_solar,
+                           qmins, qmaxs, cmaxs, dmaxs, Q0s, demand, demand_flex, phis, tariffs, res_ids, com_ids,
+                           start_dict, end_dict, charge_dict,
+                           t_res= 0.25):
+    # run LC for each node
+    c_network = np.zeros(demand.shape)
+    d_network = np.zeros(demand.shape)
+    u_network = np.zeros(demand.shape)
+    ev_network = np.zeros(demand.shape)
+    cost_network = np.zeros(demand.shape[0])
+
+    for node in range(demand.shape[0]):
+        print('node:', node)
+        P = demand[node, :]
+        ubase = demand_flex[node, :]
+        umax = np.max(ubase)
+        phi = phis[node]
+        if node in nodes_storage:
+            idx = close_idx(nodes_solar, node)
+            Qmin = qmins[idx]
+            Qmax = qmaxs[idx]
+            cmax = cmaxs[idx]
+            dmax = dmaxs[idx]
+            Q0 = Q0s[idx]
+        else:
+            Qmin = 0
+            Qmax = 0
+            cmax = 0
+            dmax = 0
+            Q0 = 0
+
+        if node in res_ids:
+            lambda_e = tariffs[0, :]
+        elif node in com_ids:
+            lambda_e = tariffs[2, :]
+        else:
+            lambda_e = tariffs[0, :]
+
+        # array of start times = start_dict[node][day]
+        start_time = start_dict[node]
+        end_time = end_dict[node]
+        charge = charge_dict[node]
+
+        # expand data to full horizon
+        start_time = expand_ev_times(start_time)
+        end_time = expand_ev_times(end_time)
+        #print(end_time - start_time)
+        end_time = end_time + (end_time - start_time) * 1.5
+        end_time = np.array(end_time, dtype=int)
+        #print(end_time - start_time)
+        charge = np.concatenate(charge)
+
+        lambda_e = np.tile(lambda_e, 365)
+
+        c, d, Q, u, ev_c_all, ev_c_dict, ev_q_dict, cost, status = \
+            local_controller_outer_node(P, lambda_b, Qmin, Qmax, Q0, cmax, dmax, gamma_l,
+                                       gamma_d, gamma_c, lambda_e, ubase, umax, phi, start_time, end_time,
+                                       charge, charging_power,
+                                    t_res= 0.25)
+
+        c_network[node, :] = c
+        d_network[node, :] = d
+        u_network[node, :] = u
+        ev_network[node, :] = ev_c_all
+        cost_network[node] = cost
+
+    return c_network, d_network, u_network, ev_network, cost_network
+
+
+def local_controller_outer_node(P, lambda_b, Qmin, Qmax, Q0, cmax, dmax, gamma_l,
+                                       gamma_d, gamma_c, lambda_e, ubase, umax, phi, start_time, end_time,
+                                       charge, charging_power,
+                                    t_res= 0.25):
+    # Within node run LC for T period over whole year
+    #for i in range(int(P.size * t_res / 24)):
+
+    T = P.size
+    #print('T', T)
+
+    c, d, Q, u, ev_c_all, ev_c_dict, ev_q_dict, cost, status = \
+        local_controller_EV_flex_solve(P, lambda_b, T, Qmin, Qmax, Q0, cmax, dmax, gamma_l,
+                                       gamma_d, gamma_c, lambda_e, ubase, umax, phi, start_time, end_time,
+                                       charge, charging_power)
+
+    print('cost', cost)
+
+    return c, d, Q, u, ev_c_all, ev_c_dict, ev_q_dict, cost, status
 
 
 if __name__ == '__main__':
+    name = 'rural_san_benito/'
+    year = 2050
 
-    lambda_b = 0.01
-    lambda_cap = 100
-    T = 24 * 4  # 15 minute resolution
+    lambda_b = 0.001
+    lambda_grid = 125
+    T = 24 * 4 * 2  # 15 minute resolution 2 day overlapping windows
     t_res = 15.0/60.0
-    Qmin = 0
-    Qmax = 12
-    cmax = Qmax/3.0
-    dmax = Qmax/3.0
+    gamma_l = 1
+    gamma_d = 0.93
+    gamma_c = 0.93
+    charging_power = 6.3
 
-    P = np.array([3 * np.sin(x * 2 * np.pi / T - np.pi) + 2 for x in np.arange(T)])
-    Q0 = Qmax / 2.0
+    data = np.load(name + 'storage_data.npz')
+    nodes_storage = data['nodesStorage']
+    nodes_solar = data['nodesSolar']
+    qmins = data['qmin']
+    qmaxs = data['qmax']
+    cmaxs = -data['umin']
+    dmaxs = data['umax']
+    Q0s = qmaxs * 0.5
+    phis = data['phis']
 
-    gamma_l = 0.9999
-    gamma_d = 0.95
-    gamma_c = 0.95
-    lambda_e = np.hstack((.202 * np.ones((1, 16*4)), .463 * np.ones((1, 5*4)), .202 * np.ones((1, 3*4))))
-    umin = -2*np.ones(T)
-    umax = 6*np.ones(T)
+    data = np.load(name + 'demand_data.npz')
+    res_ids = data['res_ids']
+    com_ids = data['com_ids']
+    #demand_ev = np.loadtxt(name + 'demand_solar_ev.csv')
+    demand = np.loadtxt(name + 'demand_solar.csv')
+    demand_flex = np.loadtxt(name + 'demand_flex.csv')
+    tariffs = np.loadtxt(name + 'tariffs.csv')
 
-    c, d, Q, bounds_cost, status = local_controller_solve(P, lambda_b, lambda_cap, T, t_res, Qmin, Qmax, Q0,
-                                                        cmax, dmax, gamma_l, gamma_d, gamma_c, lambda_e, umin, umax)
+    data = np.load(name + 'EV_charging_data' + '.npz', allow_pickle=True)
+    start_dict = data['start_dict'][()]
+    end_dict = data['end_dict'][()]
+    charge_dict = data['charge_dict'][()]
 
-    #print('charge profile', c - d)
-    print('bounds violation', bounds_cost)
-    print('controller status', status)
+    c_network, d_network, u_network, ev_network, cost_network = \
+        local_controller_outer(lambda_b, T, gamma_l, gamma_d, gamma_c, charging_power, nodes_storage, nodes_solar,
+                           qmins, qmaxs, cmaxs, dmaxs, Q0s, demand, demand_flex, phis, tariffs, res_ids, com_ids,
+                           start_dict, end_dict, charge_dict,
+                           t_res= 0.25)
 
-    plt.figure()
-    plt.plot(P)
-    plt.plot(c - d)
-    plt.plot(P + c - d)
-    plt.plot(lambda_e)
-    plt.legend(('load', 'battery', 'net', 'price'))
-    plt.show()
+    np.savez(name + 'LC_data.npz', c_network=c_network, d_network=d_network, u_network=u_network,
+             ev_network=ev_network, cost_network=cost_network)
+    print('SAVED LC DATA')
 
-    P = np.array([0]*4*4*15 + [200]*2*15 + [0]*3*4*15 + [200]*2*15 + [0]*1*4*15 + [200]*2*15 + [0]*4*4*15 + [200]*2*15
-                 + [0]*4*4*15 + [200]*2*15 + [0]*1*4*15 + [200]*2*15 + [0]*4*4*15)
-    Q0 = Qmax / 2.0
 
-    start_time, end_time, charge, charging_power = np.loadtxt('EV_data.csv')
-
-    c, d, Q, ev_c_all, ev_c_dict, ev_q_dict, bounds_cost, status = local_controller_EV_solve(P, lambda_b, lambda_cap, T,
-                                                                                             Qmin, Qmax, Q0,
-                                                                                             cmax, dmax, gamma_l,
-                                                                                             gamma_d, gamma_c, lambda_e,
-                                                                                             umin,
-                                                                                             umax, start_time, end_time,
-                                                                                             charge, charging_power)
-
-    # print('charge profile', c - d)
-    print('bounds violation', bounds_cost)
-    print('controller status', status)
-
-    x = np.arange(4*24*15)/4./15.
-    plt.figure()
-    plt.plot(x, P)
-    plt.legend(('Demand',), loc='upper right')
-    plt.ylabel('Demand [kW]')
-    plt.xlabel('Time [hour]')
-    plt.ylim(-150,210)
-    plt.figure()
-    plt.plot(x, P + c - d)
-    plt.plot(x, c - d)
-    plt.legend(('Net demand','Battery'))
-    plt.ylabel('Demand [kW]')
-    plt.xlabel('Time [hour]')
-    plt.ylim(-150, 210)
-    plt.show()
 

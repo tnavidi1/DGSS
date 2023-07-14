@@ -19,9 +19,11 @@ def assign_cars_to_nodes(spot_loads, total_EVs=1200, garage_threshold=17):
     alphas = spot_loads[load_nodes]/np.sum(spot_loads)
     EVs_per_node = total_EVs * alphas
     EVs_per_node = np.array(EVs_per_node, dtype=int)
+    while np.sum(EVs_per_node) < total_EVs:
+        id = np.random.choice(np.arange(EVs_per_node.size), 1)
+        EVs_per_node[id] += 1
 
-    print('number of load nodes', len(EVs_per_node))
-
+    # print('number of load nodes', len(EVs_per_node))
     # print('EVs per node', EVs_per_node)
     # print(np.sum(EVs_per_node))
 
@@ -33,8 +35,8 @@ def assign_cars_to_nodes(spot_loads, total_EVs=1200, garage_threshold=17):
     home_ids = np.where(EVs_per_node <= garage_threshold)[0]
     # print('home node ids', home_ids)
 
-    print('cars in work chargers', np.sum(EVs_per_node[garage_ids]))
-    print('cars in home chargers', np.sum(EVs_per_node[home_ids]))
+    #print('cars in work chargers', np.sum(EVs_per_node[garage_ids]))
+    #print('cars in home chargers', np.sum(EVs_per_node[home_ids]))
 
     return EVs_per_node, garage_ids, home_ids
 

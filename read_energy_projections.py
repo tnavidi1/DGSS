@@ -27,10 +27,10 @@ def read_flex(state, sector, year):
     #state = 'AZ'  # total MWh = 29540735
     #state = 'IA'  # total MWh = 17938337
 
-    energy_b = df[(df.Year == year) & (df.State == state) & (df.Sector == sector) & (df.TechnologyAdvancement == tech)
-            & (df.Flexibility == flex_b)].LoadMW
-    energy_e = df[(df.Year == year) & (df.State == state) & (df.Sector == sector) & (df.TechnologyAdvancement == tech)
-                   & (df.Flexibility == flex_e)].LoadMW
+    energy_b = np.sum(df[(df.Year == year) & (df.State == state) & (df.Sector == sector) & (df.TechnologyAdvancement == tech)
+            & (df.Flexibility == flex_b)].LoadMW)
+    energy_e = np.sum(df[(df.Year == year) & (df.State == state) & (df.Sector == sector) & (df.TechnologyAdvancement == tech)
+                   & (df.Flexibility == flex_e)].LoadMW)
 
     #print(np.sum(energy_b))
     #print(np.sum(energy_e))
@@ -168,16 +168,22 @@ def read_energy():
 def read_electrification(state, sector, year):
     fname = 'data/EFSLoadProfile_High_Moderate.csv'
     df = pd.read_csv(fname)
-    print(df.columns)
-    print(df.Electrification.unique())
-    print(df.TechnologyAdvancement.unique())
-    print(df.Year.unique())
-    print(df.State.unique())
+    #print(df.columns)
+    #print(df.Electrification.unique())
+    #print(df.TechnologyAdvancement.unique())
+    #print(df.Year.unique())
+    #print(df.State.unique())
     print(df.Sector.unique())
-    print(df[df.Sector == 'Residential'].Subsector.unique())
-    print(df[df.Sector == 'Commercial'].Subsector.unique())
+    #print(df[df.Sector == 'Residential'].Subsector.unique())
+    #print(df[df.Sector == 'Commercial'].Subsector.unique())
+
+    print(year)
+    sector_ev = 'Transportation'
+    sub_ev1 = 'light-duty vehicles'
 
     year_base = 2018
+
+    com_all = np.sum(df[(df.Year == year) & (df.State == state) & (df.Sector == 'Commercial')].LoadMW)
 
     res_base = np.sum(df[(df.Year == year_base) & (df.State == state) & (df.Sector == sector)].LoadMW)
     res_space_base = np.sum(df[(df.Year == year_base) & (df.State == state) & (df.Sector == sector)
@@ -193,13 +199,22 @@ def read_electrification(state, sector, year):
                           & (df.Subsector == 'water heating')].LoadMW)
     res_other = res_all - res_water - res_space
 
+    base_ev1 = np.sum(np.nan_to_num(
+        df[(df.Year == year_base) & (df.State == state) & (df.Sector == sector_ev) & (df.Subsector == sub_ev1)].LoadMW))
+
+    ev1 = np.sum(np.nan_to_num(
+        df[(df.Year == year) & (df.State == state) & (df.Sector == sector_ev) & (df.Subsector == sub_ev1)].LoadMW))
+
+    ev_ratio = (ev1 - base_ev1) / (com_all + res_all)
+
+    print('ratio of new ev energy to baseline total energy', ev_ratio)
     print('ratio of new space energy to baseline total energy', (res_space - res_space_base) / res_base)
     print('ratio of new water energy to baseline total energy', (res_water - res_water_base) / res_base)
     print('ratio of new other energy to baseline total energy', (res_other - res_other_base) / res_base)
     print('ratio of new all energy to baseline total energy', (res_all - res_base) / res_base)
 
-    return (res_space - res_space_base) / res_base, (res_water - res_water_base) / res_base, (
-                res_other - res_other_base) / res_base, (res_all - res_base) / res_base
+    return ev_ratio, (res_space - res_space_base) / res_base, (res_water - res_water_base) / res_base, (
+                res_other - res_other_base) / res_base, res_all
 
 
 def solar_storage_pen(pen2050):
@@ -228,21 +243,54 @@ if __name__ == '__main__':
         sacramento	16.33
         iowa	8.28
     """
-    name = 'tracy/'
-    years, solar, storage = solar_storage_pen(16.33)
-
-    state = 'CA'
-    # state = 'VT'
+    # name = 'tracy/'
+    # name = 'rural_san_benito/'
+    name = 'vermont/'
+    solar_pen = 13.11
+    # state = 'CA'
+    state = 'VT'
     sector = 'Residential'
     # sector = 'Commercial'
+
+    years, solar, storage = solar_storage_pen(solar_pen)
+
     year_base = 2018
-    year = 2050
-    space, water, other, all = read_electrification(state, sector, year)
-    flex_b, flex_e = read_flex(state, sector, year)
+    # years = np.array([2020, 2024, 2030, 2035, 2040, 2045, 2050])
+    evs = []
+    spaces = []
+    waters = []
+    others = []
+    alls = []
+    flex_bs = []
+    flex_es = []
+    for year in years:
+        if year == 2035 or year == 2045:
+            evs.append(np.nan)
+            spaces.append(np.nan)
+            waters.append(np.nan)
+            others.append(np.nan)
+            alls.append(np.nan)
+            flex_bs.append(np.nan)
+            flex_es.append(np.nan)
+            continue
+
+        ev, space, water, other, all = read_electrification(state, sector, year)
+        flex_b, flex_e = read_flex(state, sector, year)
+        evs.append(100 * ev)
+        spaces.append(100 * space)
+        waters.append(100 * water)
+        others.append(100 * other)
+        alls.append(all)
+        flex_bs.append(100 * flex_b / all)
+        flex_es.append(100 * flex_e / all)
+        print(flex_bs)
+        print(flex_es)
 
     pens = pd.DataFrame(
-        {'year': years, 'solar': solar, 'storage': storage, 'space': space, 'water': water, 'other': other,
-         'flexibility': flex})
+        {'year': years, 'solar': solar, 'storage': storage, 'ev': evs, 'space': spaces, 'water': waters, 'other': others,
+         'flexibility base': flex_bs, 'flexibility enhanced': flex_es})
 
-    pens.to_csv(name + 'penetrations.csv')
+    pens.to_csv(name + sector + '_' + 'penetrations.csv')
+    # NOTE:
+    # Years 2025, 2035, and 2045 are not in the dataset. They must be interpolated from the data.
 

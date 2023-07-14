@@ -206,54 +206,54 @@ def plot_errors(error_v, error_ti, error_tr, v_profile_test, y_v, t_profile_imag
     return True
 
 
+def assign_voltage_limits(v_base):
+    v_max = np.ones(v_base.shape[0]) * 1.05
+    v_min = np.ones(v_base.shape[0]) * 0.95
+
+    return v_max, v_min
+
+
+def clean_voltages(v_profile, v_max, v_min):
+    connected = np.min(v_profile, axis=1) > 0.01
+    v_profile = v_profile[connected, :]
+    v_max = v_max[connected]
+    v_min = v_min[connected]
+
+    # align substation transformer tap
+    v_profile = v_profile - np.mean(v_profile[0, :]) + 1
+
+    return v_profile, v_max, v_min
+
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train data driven models')
-    parser.add_argument('--train', default=1, help='random seed')
-    parser.add_argument('--storagePen', default=1, help='storage penetration percentage times 10')
-    parser.add_argument('--solarPen', default=5, help='solar penetration percentage times 10')
-    parser.add_argument('--evPen', default=5, help='EV penetration percentage times 10')
-    parser.add_argument('--network', default='iowa', help='name of network to simulate')
-    parser.add_argument('--days', default=60, help='number of days to simulate')
-
-    FLAGS, unparsed = parser.parse_known_args()
-    print('running with arguments: ({})'.format(FLAGS))
-
-    path_networks = 'Networks/'
-    path_absolute = './'
-
-    # parse inputs
-    storagePen, solarPen, evPen, dir_network, n_days, t_res = parse_inputs(FLAGS)
+    name = 'rural_san_benito/'
+    controller = 'local'
+    t_res = 0.25
 
     # Define length of training set
-    t_idx = t_res * 90  # 30 days of training data
+    t_idx = 90 / t_res  # 90 days of training data
 
     # load grid data
-    v_profile = np.loadtxt(path_absolute + path_networks + dir_network + 'v_profile.csv')
-    t_profile_real = np.loadtxt(path_absolute + path_networks + dir_network + 't_profile_real.csv')
-    t_profile_imag = np.loadtxt(path_absolute + path_networks + dir_network + 't_profile_imag.csv')
-    taps_profile = np.loadtxt(path_absolute + path_networks + dir_network + 'taps_profile.csv')
-
-    """
-    print(np.max(v_profile))
-    print(np.min(v_profile))
-    print(v_profile.shape)
-    print(np.sum(v_profile[:, -30*24:] > 1.04))
-    print(np.sum(v_profile[:, -30*24:] > 1.03))
-    print(np.sum(v_profile[:, -30*24:] < 0.96))
-    print(np.sum(v_profile[:, -30*24:] < 0.95))
-    print(np.sum(v_profile[:, -30*24:] < 0.94))
-    print(t_profile_real.shape)
-    print(np.sum(np.sqrt(t_profile_real[:, -30*24:]**2 + t_profile_imag[:, -30*24:]**2) >
-                 0.8 * np.tile(np.max(np.sqrt(t_profile_real**2 + t_profile_imag**2), axis=1).reshape((535,1)), (1, 30*24))))
-    #print(0.8 * np.max(np.sqrt(t_profile_real**2 + t_profile_imag**2), axis=1))
-    print(taps_profile[:, -48:])
-    """
+    data = np.load(name + controller + '_metrics.npz')
+    t_profile_real = data['t_real_all']
+    t_profile_imag = data['t_reac_all']
+    v_mags_all = data['v_mags_all']
+    v_max, v_min = assign_voltage_limits(v_mags_all)
+    v_profile, v_max, v_min = clean_voltages(v_mags_all, v_max, v_min)
 
     # load demand data
-    # demand = np.loadtxt(path_networks + dir_network + 'raw_demand.csv')
-    # demand = np.loadtxt(path_networks + dir_network + 'demand_solar.csv')
-    demand = np.loadtxt(path_networks + dir_network + 'demand_solar_ev.csv')
-    demand_imag = np.loadtxt(path_networks + dir_network + 'raw_demand_imag.csv')
+    data = np.load(name + 'LC_data.npz')
+    c_network = data['c_network']
+    d_network = data['d_network']
+    u_network = data['u_network']
+    ev_network = data['ev_network']
+    cost_network = data['cost_network']
+    _, _, demand_imag, _, res_ids, com_ids = load_demand_data_flex(name)
+    demand_ev = np.loadtxt(name + 'demand_solar_ev.csv')
+    #demand = np.loadtxt(name + 'demand_solar.csv')
+    demand = demand_ev + c_network - d_network + u_network
+    pf = 0.92
+    demand_imag = demand_imag + np.tan(np.arccos(pf)) * u_network
 
     # Stack real and reactive power demand into training and test set
     pq_train, pq_test = train_test_split(np.vstack((demand, demand_imag)), t_idx)
