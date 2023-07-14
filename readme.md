@@ -70,9 +70,12 @@ Each python file contains code related to a different aspect of the simulation. 
 
 # Procedure
 1. Download datafiles as shown in Datafiles section
-3. run process_data.py to generate the scenario including PV, EV, and storage placement
-4. run local_controller.py to simulate the local controller on the scenario
-5. run read_results.py to evaluate the results of the power flow simulation under local control
-6. run DD_models.py to train the models used by the centralized controller
-7. run global_optimization.py to simulate the centralized controller on the scenario
-8. run read_results.py to evaluate the results of the power flow simulation under centralized control
+2. run process_data.py to generate the scenario including electrified loads, PV, EV, and storage placement
+3. run local_controller.py to simulate the local controller on the scenario
+4. run read_results.py to evaluate the results of the power flow simulation under local control
+5. run DD_models.py to train the models used by the centralized controller
+6. run global_optimization.py to simulate the centralized controller on the scenario
+7. run read_results.py to evaluate the results of the power flow simulation under centralized control
+
+Note that running local_controller.py, read_results.py, and global_optimization.py for the full year horizon has a very long runtime
+
