@@ -370,7 +370,7 @@ if __name__ == '__main__':
         raise ValueError('MOSEK is not installed. Cannot run optimization')
 
     # daily loop
-    for day in range(n_days):
+    for day in range(n_days-1):
         print('running day', day)
 
         # extract perfect foresight data for current loop
